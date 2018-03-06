@@ -1,0 +1,11 @@
+.
+..
+
+*.pl
+*.log
+*.swp
+^[~.]
+
+id_rsa
+vendor/
+*.lock
