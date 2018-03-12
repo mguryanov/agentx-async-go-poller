@@ -3,7 +3,7 @@
 
 *.pl
 *.log
-*.swp
+*.sw*
 ^[~.]
 
 id_rsa

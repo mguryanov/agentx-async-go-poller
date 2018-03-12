@@ -9,14 +9,18 @@ package main
  */
 
 import (
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/posteo/go-agentx"
@@ -78,11 +82,16 @@ type cacheRow struct {
 	Value string
 }
 
-type pollerCtx struct {
+type globalCtx struct {
 	session *agentx.Session
-	wg      *sync.WaitGroup
-	item    Item
+	wg      sync.WaitGroup
+	done    chan bool
 	baseOID string
+}
+
+type pollerCtx struct {
+	globalCtx
+	item Item
 }
 
 const (
@@ -93,30 +102,17 @@ func main() {
 
 	cfg := agentxConf{}
 	fn, _ := filepath.Abs(confFile)
+
 	fcfg, err := ioutil.ReadFile(fn)
 	if err != nil {
 		panic(err)
 	}
 
-	err = yaml.Unmarshal(fcfg, &cfg)
-	if err != nil {
+	if err := yaml.Unmarshal(fcfg, &cfg); err != nil {
 		panic(err)
 	}
 
-	log.Printf("%#v", cfg)
-
-	client := &agentx.Client{
-		Net:               cfg.Connect.Prot,
-		Address:           cfg.Connect.Host + ":" + cfg.Connect.Port,
-		Timeout:           time.Duration(cfg.Connect.Timeout) * time.Minute,
-		ReconnectInterval: time.Duration(cfg.Connect.Retry.Period) * time.Second,
-	}
-
-	if err = client.Open(); err != nil {
-		log.Fatalf(errgo.Details(err))
-	}
-
-	session, err := client.Session()
+	session, err := getSession(&cfg.Connect)
 	if err != nil {
 		log.Fatalf(errgo.Details(err))
 	}
@@ -127,26 +123,90 @@ func main() {
 		log.Fatalf(errgo.Details(err))
 	}
 
-	pollingLoop(session, &cfg)
+	ctx := globalCtx{
+		session: session,
+		baseOID: cfg.Discovery.OID}
+
+	if err := setSignal(&ctx); err != nil {
+		log.Fatalf(errgo.Details(err))
+	}
+
+	pollingLoop(&ctx, &cfg)
 }
 
-func pollingLoop(s *agentx.Session, cfg *agentxConf) {
-	var wg sync.WaitGroup
-	for _, item := range cfg.Discovery.Items {
-		wg.Add(1)
-		go startPoll(
-			pollerCtx{
-				s,
-				&wg,
-				item,
-				cfg.Discovery.OID})
+func setSignal(ctx *globalCtx) error {
+	signal_chan := make(chan os.Signal, 1)
+	signal.Notify(signal_chan,
+		syscall.SIGHUP,
+		syscall.SIGINT,
+		syscall.SIGTERM,
+		syscall.SIGQUIT)
+	exit_chan := make(chan int)
+	go func() {
+		for {
+			s := <-signal_chan
+			switch s {
+			// kill -SIGHUP XXXX
+			case syscall.SIGHUP:
+				fmt.Println("hungup")
+
+				// kill -SIGINT XXXX or Ctrl+c
+			case syscall.SIGINT:
+				fmt.Println("Warikomi")
+
+				// kill -SIGTERM XXXX
+			case syscall.SIGTERM:
+				fmt.Println("force stop")
+				exit_chan <- 0
+
+				// kill -SIGQUIT XXXX
+			case syscall.SIGQUIT:
+				fmt.Println("stop and core dump")
+				exit_chan <- 0
+
+			default:
+				fmt.Println("Unknown signal.")
+				exit_chan <- 1
+			}
+		}
+		appCleanup(ctx)
+		code := <-exit_chan
+		os.Exit(code)
+	}()
+	return nil
+}
+
+func appCleanup(ctx *globalCtx) {
+	log.Println("CLEANUP APP BEFORE EXIT!!!")
+	ctx.done <- true
+}
+
+func getSession(cfg *Connect) (*agentx.Session, error) {
+
+	client := &agentx.Client{
+		Net:               cfg.Prot,
+		Address:           cfg.Host + ":" + cfg.Port,
+		Timeout:           time.Duration(cfg.Timeout) * time.Minute,
+		ReconnectInterval: time.Duration(cfg.Retry.Period) * time.Second,
 	}
-	wg.Wait()
+
+	if err := client.Open(); err != nil {
+		return nil, err
+	}
+
+	return client.Session()
+}
+
+func pollingLoop(ctx *globalCtx, cfg *agentxConf) {
+	for _, item := range cfg.Discovery.Items {
+		ctx.wg.Add(1)
+		go startPoll(pollerCtx{*ctx, item})
+	}
+	ctx.wg.Wait()
 }
 
 func startPoll(ctx pollerCtx) {
 	done := make(chan bool)
-	cache := make(map[string]string)
 
 	log.Println("startPoll: begin goroutine")
 
@@ -164,8 +224,6 @@ func startPoll(ctx pollerCtx) {
 			log.Println("startPoll: recieved pipeRows")
 			indexOid := baseIndexOID + result.Index
 			valueOid := baseValueOID + result.Index
-			cache[indexOid] = result.Index
-			cache[valueOid] = result.Value
 			ii := handler.Add(indexOid)
 			ii.Type = pdu.VariableTypeInteger
 			i64, _ := strconv.ParseInt(result.Index, 10, 32)
@@ -173,9 +231,8 @@ func startPoll(ctx pollerCtx) {
 			vi := handler.Add(valueOid)
 			vi.Type = pdu.VariableTypeOctetString
 			vi.Value = result.Value
-
-			log.Printf("%#v", cache)
 		}
+
 		done <- true
 		time.Sleep(time.Duration(pollPeriod) * time.Second)
 	}
