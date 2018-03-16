@@ -1,0 +1,17 @@
+#!/usr/bin/make -f
+# -*- makefile -*-
+
+# Uncomment this to turn on verbose mode.
+export DH_VERBOSE=1
+export DEB_BUILD_OPTIONS=nostrip
+
+%:
+		dh $@ 
+
+override_dh_auto_install:
+		dh_auto_install
+		test -d '$(CURDIR)/debian/agentx-async-go-poller/etc/init/' || mkdir -p '$(CURDIR)/debian/agentx-async-go-poller/etc/init/'
+		test -d '$(CURDIR)/debian/agentx-async-go-poller/etc/snmp/' || mkdir -p '$(CURDIR)/debian/agentx-async-go-poller/etc/snmp/'
+		/usr/bin/install -o root -g root -m 644 $(CURDIR)/debian/agentx.yml  debian/agentx-async-go-poller/etc/snmp
+		/usr/bin/install -o root -g root -m 644 $(CURDIR)/debian/agentx-async-poller.conf  debian/agentx-async-go-poller/etc/init
+		/usr/bin/install -o root -g root -m 755 $(CURDIR)/debian/bin/agentx-async-poller  debian/agentx-async-go-poller/etc/snmp

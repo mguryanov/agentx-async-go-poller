@@ -1,0 +1,5 @@
+agentx-async-go-poller (0.1.0-1) unstable; urgency=low
+
+  * Initial release (Closes: #nnnn)  <nnnn is the bug number of your ITP>
+
+ -- Maxim Guryanov <guryanov@info74.ru>  Fri, 16 Mar 2018 11:51:52 +0500

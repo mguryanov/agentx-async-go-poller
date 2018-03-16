@@ -1,0 +1,13 @@
+Source: agentx-async-go-poller
+Section: net
+Priority: optional
+Maintainer: Maxim Guryanov <guryanov@info74.ru>
+Build-Depends: debhelper (>= 8.0.0)
+Standards-Version: 3.9.4
+Vcs-Git: git://github.com:mguryanov/agentx-async-go-poller.git 
+
+Package: agentx-async-go-poller
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: SNMP AgentX extension
+ SNMP extension (protocol AgentX, RFC 2741) for asynchronous polling any metrics by executing external scripts
