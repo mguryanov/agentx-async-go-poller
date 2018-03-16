@@ -2,8 +2,8 @@ package main
 
 /*
 * daemonization:
-* - is a OS level question, not a programming language level question
-* - using init systems like systemd, launchd, daemontools, supervisor,
+* + is a OS level question, not a programming language level question
+* + using init systems like systemd, launchd, daemontools, supervisor,
 *   runit, Kubernetes, heroku, Borg, etc etc
 * - https://github.com/sevlyar/go-daemon
  */
@@ -13,6 +13,8 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -39,6 +41,10 @@ type Connect struct {
 		Period int64 `yaml:"period"`
 		Count  int64 `yaml:"count"`
 	} `yaml:"retry"`
+}
+
+type Health struct {
+	Port string `yaml:"port"`
 }
 
 type Item struct {
@@ -74,6 +80,7 @@ type Discovery struct {
 
 type agentxConf struct {
 	Connect   `yaml:"connect"`
+	Health    `yaml:"health"`
 	Discovery `yaml:"discovery"`
 }
 
@@ -95,13 +102,12 @@ type pollerCtx struct {
 }
 
 const (
-	confFile = "./agentx.yml"
+	confFile = "agentx.yml"
 )
 
 func main() {
-
 	cfg := agentxConf{}
-	fn, _ := filepath.Abs(confFile)
+	fn, _ := filepath.Abs(filepath.Dir(os.Args[0]) + "/" + confFile)
 
 	fcfg, err := ioutil.ReadFile(fn)
 	if err != nil {
@@ -123,14 +129,19 @@ func main() {
 		log.Fatalf(errgo.Details(err))
 	}
 
+	done := make(chan bool)
+	defer close(done)
+
 	ctx := globalCtx{
 		session: session,
+		done:    done,
 		baseOID: cfg.Discovery.OID}
 
 	if err := setSignal(&ctx); err != nil {
 		log.Fatalf(errgo.Details(err))
 	}
 
+	healthServerInit(&cfg)
 	pollingLoop(&ctx, &cfg)
 }
 
@@ -141,48 +152,51 @@ func setSignal(ctx *globalCtx) error {
 		syscall.SIGINT,
 		syscall.SIGTERM,
 		syscall.SIGQUIT)
-	exit_chan := make(chan int)
 	go func() {
+		code := 0
+		break_loop := false
 		for {
 			s := <-signal_chan
 			switch s {
-			// kill -SIGHUP XXXX
 			case syscall.SIGHUP:
 				fmt.Println("hungup")
 
-				// kill -SIGINT XXXX or Ctrl+c
 			case syscall.SIGINT:
 				fmt.Println("Warikomi")
 
-				// kill -SIGTERM XXXX
 			case syscall.SIGTERM:
 				fmt.Println("force stop")
-				exit_chan <- 0
+				break_loop = true
 
-				// kill -SIGQUIT XXXX
 			case syscall.SIGQUIT:
 				fmt.Println("stop and core dump")
-				exit_chan <- 0
+				break_loop = true
 
 			default:
 				fmt.Println("Unknown signal.")
-				exit_chan <- 1
+				code = 1
+				break_loop = true
+			}
+			if break_loop {
+				break
 			}
 		}
 		appCleanup(ctx)
-		code := <-exit_chan
 		os.Exit(code)
 	}()
 	return nil
 }
 
 func appCleanup(ctx *globalCtx) {
-	log.Println("CLEANUP APP BEFORE EXIT!!!")
-	ctx.done <- true
+	select {
+	case <-time.After(1 * time.Second):
+		log.Println("appCleanup: finished by timeout")
+	case ctx.done <- true:
+		log.Println("appCleanup: finished by done signal")
+	}
 }
 
 func getSession(cfg *Connect) (*agentx.Session, error) {
-
 	client := &agentx.Client{
 		Net:               cfg.Prot,
 		Address:           cfg.Host + ":" + cfg.Port,
@@ -197,6 +211,20 @@ func getSession(cfg *Connect) (*agentx.Session, error) {
 	return client.Session()
 }
 
+func healthServerInit(cfg *agentxConf) {
+	s := &http.Server{
+		Handler: http.HandlerFunc(healthRequestHandler)}
+	l, err := net.Listen("tcp4", "0.0.0.0:"+cfg.Health.Port)
+	if err != nil {
+		log.Fatalf(errgo.Details(err))
+	}
+	go s.Serve(l.(*net.TCPListener))
+}
+
+func healthRequestHandler(w http.ResponseWriter, r *http.Request) {
+	io.WriteString(w, "alive\n")
+}
+
 func pollingLoop(ctx *globalCtx, cfg *agentxConf) {
 	for _, item := range cfg.Discovery.Items {
 		ctx.wg.Add(1)
@@ -206,11 +234,7 @@ func pollingLoop(ctx *globalCtx, cfg *agentxConf) {
 }
 
 func startPoll(ctx pollerCtx) {
-	done := make(chan bool)
-
-	log.Println("startPoll: begin goroutine")
-
-	defer close(done)
+	/* log.Println("startPoll: begin goroutine") */
 	defer ctx.wg.Done()
 
 	baseIndexOID := ctx.baseOID + ctx.item.OID.Index + "."
@@ -220,8 +244,8 @@ func startPoll(ctx pollerCtx) {
 	handler := ctx.session.Handler.(*agentx.ListHandler)
 
 	for {
-		for result := range getValues(done, ctx.item, getIndexs(done, ctx.item)) {
-			log.Println("startPoll: recieved pipeRows")
+		for result := range getValues(ctx.done, ctx.item, getIndexs(ctx.done, ctx.item)) {
+			/* log.Println("startPoll: recieved pipeRows") */
 			indexOid := baseIndexOID + result.Index
 			valueOid := baseValueOID + result.Index
 			ii := handler.Add(indexOid)
@@ -233,7 +257,7 @@ func startPoll(ctx pollerCtx) {
 			vi.Value = result.Value
 		}
 
-		done <- true
+		ctx.done <- true
 		time.Sleep(time.Duration(pollPeriod) * time.Second)
 	}
 }
@@ -242,7 +266,7 @@ var getValues = func(done <-chan bool, cfg Item, indexStream <-chan string) <-ch
 	cacheRowStream := make(chan cacheRow)
 
 	go func() {
-		defer log.Println("readIndexPipe exited!")
+		/* defer log.Println("readIndexPipe exited!") */
 		defer close(cacheRowStream)
 
 		for _, i := range strings.Split(<-indexStream, " ") {
@@ -275,7 +299,7 @@ var getValues = func(done <-chan bool, cfg Item, indexStream <-chan string) <-ch
 				return
 
 			case <-time.After(timeout):
-				log.Println("getValues: process were killed")
+				/* log.Println("getValues: process were killed") */
 				return
 
 			case result := <-ch:
@@ -288,7 +312,7 @@ var getValues = func(done <-chan bool, cfg Item, indexStream <-chan string) <-ch
 					return
 
 				case cacheRowStream <- cacheRow{i, result}:
-					log.Printf("getValues: send to rowStream %#v", i)
+					log.Printf("getValues: send to rowStream %#v %s", i, result)
 					stdout.Close()
 					cmd.Process.Kill()
 				}
@@ -307,7 +331,7 @@ var getIndexs = func(done chan bool, cfg Item) <-chan string {
 	indexStream := make(chan string)
 
 	go func() {
-		defer log.Println("getIndexs exited!")
+		/* defer log.Println("getIndexs exited!") */
 		defer close(indexStream)
 
 		cmd := exec.Command(cfg.Exec.Index.Cmd, cfg.Exec.Index.Args...)
@@ -325,7 +349,7 @@ var getIndexs = func(done chan bool, cfg Item) <-chan string {
 		ch := getPipeOutputStr(stdout)
 
 		for {
-			log.Println("getIndexs: output loop begin")
+			/* log.Println("getIndexs: output loop begin") */
 
 			select {
 			case <-done:
@@ -362,7 +386,7 @@ var getPipeOutputStr = func(stdout io.ReadCloser) chan string {
 	outputStrPipe := make(chan string)
 
 	go func() {
-		defer log.Println("getPipeOutputStr: exited!")
+		/* defer log.Println("getPipeOutputStr: exited!") */
 		defer close(outputStrPipe)
 		b, _ := ioutil.ReadAll(stdout)
 		outputStrPipe <- string(b)

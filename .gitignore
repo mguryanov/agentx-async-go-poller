@@ -9,3 +9,4 @@
 id_rsa
 vendor/
 *.lock
+agentx-async-poller

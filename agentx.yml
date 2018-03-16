@@ -7,6 +7,9 @@ connect:
     period: 3
     count: 0
 
+health:
+  port: 23231
+
 discovery:
   oid: 1.3.6.1.4.1.10877
   items:
